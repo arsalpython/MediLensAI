@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 MODEL_ID = "qwen/qwen3.6-27b"
-UI_BUILD = "V13-REFERENCE-GUI-SCROLL-20260911"
+UI_BUILD = "V15-DOCTOR-BUBBLE-FIX-20260911"
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
@@ -79,6 +79,18 @@ def bullet_html(value, fallback="Nothing reliable was identified."):
 
 
 def analyze_medicine(api_key, uploaded_files):
+    """
+    Robust Groq vision call.
+
+    First attempt:
+      - Qwen 3.6 vision
+      - JSON Object Mode
+      - reasoning disabled/hidden so reasoning cannot contaminate JSON
+
+    Fallback:
+      - Retry once in normal text mode
+      - Extract the first JSON object from the returned text
+    """
     client = Groq(api_key=api_key)
 
     image_parts = []
@@ -120,7 +132,11 @@ Alternative brands:
 - Prefer Pakistan-relevant brands when known.
 - Do not imply automatic interchangeability.
 
-Return ONLY valid JSON with these keys:
+Return ONLY ONE COMPACT VALID JSON OBJECT.
+Do not use Markdown fences.
+Do not add explanations before or after the JSON.
+
+Use exactly these keys:
 {
   "classification": "medicine | medical_product | not_medicine | uncertain",
   "evidence_status": "clear_label_match | partial_label | insufficient",
@@ -146,26 +162,70 @@ Return ONLY valid JSON with these keys:
 }
 """
 
-    result = client.chat.completions.create(
-        model=MODEL_ID,
-        messages=[
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt}] + image_parts,
-            }
-        ],
-        temperature=0.05,
-        top_p=0.85,
-        max_completion_tokens=2200,
-        response_format={"type": "json_object"},
-        stream=False,
-    )
+    content = [{"type": "text", "text": prompt}] + image_parts
 
-    raw = (result.choices[0].message.content or "{}").strip()
-    if raw.startswith("```"):
-        raw = raw.replace("```json", "", 1).replace("```", "").strip()
+    # Attempt 1: Groq JSON Object Mode with Qwen reasoning disabled.
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{"role": "user", "content": content}],
+            temperature=0.2,
+            top_p=0.8,
+            max_completion_tokens=2200,
+            reasoning_effort="none",
+            reasoning_format="hidden",
+            response_format={"type": "json_object"},
+            stream=False,
+        )
 
-    return json.loads(raw)
+        raw = (completion.choices[0].message.content or "{}").strip()
+        return json.loads(raw)
+
+    except Exception as first_error:
+        # Attempt 2: Retry without JSON Object Mode.
+        # This avoids Groq rejecting the request when the model happens to emit
+        # malformed JSON during server-side JSON validation.
+        retry_prompt = prompt + """
+
+IMPORTANT RETRY:
+Your previous response could not be parsed as JSON.
+Return only the JSON object. Use double quotes for every key/string.
+Do not include trailing commas, comments, Markdown, or reasoning.
+"""
+
+        retry_content = [{"type": "text", "text": retry_prompt}] + image_parts
+
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL_ID,
+                messages=[{"role": "user", "content": retry_content}],
+                temperature=0.1,
+                top_p=0.8,
+                max_completion_tokens=2200,
+                reasoning_effort="none",
+                reasoning_format="hidden",
+                stream=False,
+            )
+
+            raw = (completion.choices[0].message.content or "").strip()
+
+            # Remove optional markdown fences if the model ignored instructions.
+            if raw.startswith("```"):
+                raw = raw.replace("```json", "", 1).replace("```", "").strip()
+
+            # Extract from first "{" through last "}" if the model added prose.
+            first = raw.find("{")
+            last = raw.rfind("}")
+            if first != -1 and last != -1 and last > first:
+                raw = raw[first:last + 1]
+
+            return json.loads(raw)
+
+        except Exception as second_error:
+            raise RuntimeError(
+                "The AI could not return a valid structured medicine report after two attempts. "
+                "Please try the image again, or upload a clearer front/back label photo."
+            ) from second_error
 
 
 # ------------------------------------------------------------
@@ -334,11 +394,11 @@ section[data-testid="stSidebar"] .block-container {{ padding:20px 12px !importan
 }}
 
 .top-brand {{
-  position:fixed;z-index:90;right:22px;top:20px;
+  position:fixed;z-index:90;right:16px;top:16px;
   display:flex;align-items:center;gap:8px;pointer-events:none;
 }}
 
-.top-moon {{ position:fixed;z-index:90;right:180px;top:24px;font-size:1rem; }}
+.top-moon {{ position:fixed;z-index:90;right:168px;top:20px;font-size:1rem; }}
 .top-brand .mini-cap {{
   width:20px;height:30px;border-radius:16px;transform:rotate(-38deg);
   background:linear-gradient(135deg,#FFB648 0 49%,#F6495B 49% 100%);
@@ -463,12 +523,45 @@ section[data-testid="stSidebar"] .block-container {{ padding:20px 12px !importan
   filter:drop-shadow(0 18px 28px rgba(11,45,85,.15));
 }}
 .doctor-note {{
-  position:absolute;right:-2px;top:28px;width:133px;border-radius:16px;
-  padding:10px 11px;background:rgba(255,255,255,.97);
-  box-shadow:0 11px 25px rgba(11,45,85,.08);
-  color:#2C4559;font-size:.60rem;line-height:1.35;
+  position:absolute;
+  right:205px;
+  top:66px;
+  width:178px;
+  border-radius:18px;
+  padding:13px 14px;
+  background:rgba(255,255,255,.98);
+  border:1px solid rgba(11,45,85,.08);
+  box-shadow:0 14px 30px rgba(11,45,85,.10);
+  color:#385467;
+  font-size:.68rem;
+  line-height:1.48;
+  text-align:left;
 }}
-.doctor-note strong {{ color:#213C51; }}
+.doctor-note::after {{
+  content:"";
+  position:absolute;
+  right:-10px;
+  top:42px;
+  width:20px;
+  height:20px;
+  background:rgba(255,255,255,.98);
+  transform:rotate(45deg);
+  border-top:1px solid rgba(11,45,85,.06);
+  border-right:1px solid rgba(11,45,85,.06);
+}}
+.doctor-note strong {{
+  display:block;
+  color:#173B55;
+  font-size:.75rem;
+  line-height:1.35;
+  margin-bottom:7px;
+}}
+.doctor-note .doctor-note-sub {{
+  display:block;
+  color:#5F7783;
+  font-size:.66rem;
+  line-height:1.45;
+}}
 
 /* -------- LOWER SECTIONS -------- */
 .section {{
@@ -516,7 +609,12 @@ button[kind="primary"] {{ background:linear-gradient(90deg,#059983,#087B82) !imp
   .block-container {{ padding-right:235px !important; }}
   .doctor {{ width:225px;height:560px;right:0; }}
   .doctor-img {{ width:215px;height:485px; }}
-  .doctor-note {{ width:120px; }}
+  .doctor-note {{
+    right:170px;
+    top:72px;
+    width:150px;
+    font-size:.64rem;
+  }}
   .trust-box {{ width:178px; }}
 }}
 
@@ -589,7 +687,7 @@ html("""
 # Doctor
 html("""
 <div class="doctor">
-  <div class="doctor-note"><strong>Hi! I'm here to help you understand your medicines.</strong><br><br>Upload a photo to get started!</div>
+  <div class="doctor-note"><strong>Hi! I’m here to help you understand your medicines.</strong><span class="doctor-note-sub">Upload a clear photo of the medicine package to get started.</span></div>
   <div class="doctor-img"></div>
 </div>
 """)
@@ -684,6 +782,11 @@ if uploaded_files:
             st.rerun()
 
     if analyze_clicked:
+        # Clear any previous result before starting a new analysis.
+        # This prevents stale medicine information from remaining on-screen
+        # if the new Groq request fails.
+        st.session_state.pop("result", None)
+
         api_key = get_api_key()
 
         if not api_key:
@@ -694,10 +797,8 @@ if uploaded_files:
             with st.spinner("Reading the medicine label and checking visible evidence..."):
                 try:
                     st.session_state["result"] = analyze_medicine(api_key, valid_files)
-                except json.JSONDecodeError:
-                    st.error("The AI returned an invalid response. Please try again.")
                 except Exception as exc:
-                    st.error(f"Groq request failed: {exc}")
+                    st.error(str(exc))
 
 result = st.session_state.get("result")
 if result:
